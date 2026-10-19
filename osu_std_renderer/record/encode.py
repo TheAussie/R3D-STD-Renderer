@@ -427,7 +427,8 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
                      stream_master: bool = False,
                      compact_path: Path | None = None,
                      preview_hw: bool = False,
-                     faststart: bool = True) -> list[str]:
+                     faststart: bool = True,
+                     mix_gain_db: "float | None" = None) -> list[str]:
     """rawvideo rgb24 on stdin → encoder → faststart mp4 (§5.6 shape).
 
     `preview_path` (INLINE PREVIEW, R3D_PREVIEW_INLINE=1 in the CLI; default
@@ -439,8 +440,12 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
     instead of libx264; the master's arguments are the same either way.
     `faststart=False` (record/audio_late.py only) leaves the index at the end
     of every output: those files are temporary and are rewritten once, when
-    the audio is joined to them."""
+    the audio is joined to them. `mix_gain_db` (R3D_STD_FIXED_GAIN=1 in the
+    CLI: `record.audio.mix_gain_db` of the mixed wav) puts that one gain
+    wherever this command would run `loudnorm` on the mix; None leaves every
+    one of them as it was."""
     w, h = resolution
+    _norm = LOUDNORM if mix_gain_db is None else f"volume={mix_gain_db:.2f}dB"
     is_vaapi = encoder == "h264_vaapi"
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
     if is_vaapi:
@@ -505,14 +510,14 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
         # (loudnorm=False), do NOT loudnorm the mixed song+hits (that ducked the
         # song under hits) -- apply only a clamp-only true-peak limiter to catch
         # summed peaks without ducking.
-        af = ([LOUDNORM] if loudnorm
+        af = ([_norm] if loudnorm
               else ["alimiter=limit=0.95:level=disabled:attack=1:release=20"])
         # STREAMABLE MASTER (R3D_STREAM_MASTER=1 in the CLI; default False):
         # the loudness pass the contributor client would run on the finished
         # file (loudnorm on the MIXED output) is applied here instead, so
         # nothing has to rewrite the master after the render.
-        if stream_master and LOUDNORM not in af:
-            af = af + [LOUDNORM]
+        if stream_master and _norm not in af:
+            af = af + [_norm]
         acodec = ["-c:a", "aac", "-b:a", audio_bitrate, "-ar", "48000",
                   "-shortest"]
     _mfast = ([] if (stream_master or not faststart)
@@ -579,9 +584,9 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
                          else "[aout]asplit=2[am][ap]")
         elif compact_path is not None:
             # the Discord copy is cut from the FINAL (normalised) audio
-            graph.append(f"[aout]asplit=2[am][ap0];[ap0]{LOUDNORM},asplit=2[ap][ac]")
+            graph.append(f"[aout]asplit=2[am][ap0];[ap0]{_norm},asplit=2[ap][ac]")
         else:
-            graph.append(f"[aout]asplit=2[am][ap0];[ap0]{LOUDNORM}[ap]")
+            graph.append(f"[aout]asplit=2[am][ap0];[ap0]{_norm}[ap]")
     if _lead and audio_path is not None:
         # `-shortest` measures the preview's video BEFORE the lead-in is cut
         # off, so it cannot be used on this output (see where it is left out

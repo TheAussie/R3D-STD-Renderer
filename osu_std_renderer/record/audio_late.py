@@ -54,7 +54,8 @@ def build_audio_cmd(*, audio_path, master_out, audio_bitrate: str = "192k",
                     loudnorm: bool = True, preview_out=None, compact_out=None,
                     total_dur_s: "float | None" = None,
                     preview_lead: bool = False,
-                    end_samples: "dict | None" = None) -> "list[str]":
+                    end_samples: "dict | None" = None,
+                    mix_gain_db: "float | None" = None) -> "list[str]":
     """The audio half of ``encode.build_ffmpeg_cmd`` as its own process: the
     same filters in the same order, the same encoders and rates, one .m4a per
     output. (tests/test_audio_late.py holds the two builders to each other.)
@@ -63,6 +64,7 @@ def build_audio_cmd(*, audio_path, master_out, audio_bitrate: str = "192k",
     output's audio where `-shortest` would have ended it beside its video
     (see video_end_sample). There is no video in this process to do it."""
     end_samples = end_samples or {}
+    _norm = LOUDNORM if mix_gain_db is None else f"volume={mix_gain_db:.2f}dB"
 
     def _end(key: str) -> str:
         n = end_samples.get(key)
@@ -73,7 +75,7 @@ def build_audio_cmd(*, audio_path, master_out, audio_bitrate: str = "192k",
         pin = "" if key == "master" else "aformat=sample_rates=48000,"
         return f"{pin}atrim=end_sample={int(n)}"
 
-    af = ([LOUDNORM] if loudnorm
+    af = ([_norm] if loudnorm
           else ["alimiter=limit=0.95:level=disabled:attack=1:release=20"])
     acodec = ["-c:a", "aac", "-b:a", audio_bitrate, "-ar", "48000"]
     cmd = _QUIET + ["-i", str(audio_path), "-vn"]
@@ -83,9 +85,9 @@ def build_audio_cmd(*, audio_path, master_out, audio_bitrate: str = "192k",
     graph = [f"[0:a]{','.join(af) or 'anull'},"
              f"aformat=sample_rates=48000[aout]"]
     if compact_out is not None:
-        graph.append(f"[aout]asplit=2[am][ap0];[ap0]{LOUDNORM},asplit=2[ap][ac]")
+        graph.append(f"[aout]asplit=2[am][ap0];[ap0]{_norm},asplit=2[ap][ac]")
     else:
-        graph.append(f"[aout]asplit=2[am][ap0];[ap0]{LOUDNORM}[ap]")
+        graph.append(f"[aout]asplit=2[am][ap0];[ap0]{_norm}[ap]")
     if preview_lead:
         # the hardware preview's audio is ended at the video's length instead
         # of by `-shortest` (see build_ffmpeg_cmd)
@@ -139,7 +141,8 @@ class LateAudio:
     def __init__(self, *, output: Path, preview_path, compact_path, mix,
                  total_dur_s: "float | None", preview_lead: bool,
                  audio_bitrate: str = "192k", loudnorm: bool = False,
-                 end_samples: "dict | None" = None):
+                 end_samples: "dict | None" = None,
+                 fixed_gain: bool = False):
         self.output = Path(output)
         self.preview_path = Path(preview_path) if preview_path else None
         self.compact_path = Path(compact_path) if compact_path else None
@@ -149,6 +152,8 @@ class LateAudio:
         self._audio_bitrate = audio_bitrate
         self._loudnorm = loudnorm
         self._end_samples = dict(end_samples or {})
+        self._fixed_gain = bool(fixed_gain)
+        self.mix_gain_db: "float | None" = None
         # what the video encoder writes instead of the real outputs
         self.video_master = _beside(self.output, "late-video", ".mp4")
         self.video_preview = (_beside(self.preview_path, "late-video", ".mp4")
@@ -182,13 +187,18 @@ class LateAudio:
             wav = self._mix(lambda *a, **k: None)   # no timing marks off-thread
             self._wav = wav
             if wav is not None:
+                if self._fixed_gain and (self._a_preview is not None
+                                         or self._loudnorm):
+                    from .audio import mix_gain_db
+                    self.mix_gain_db = mix_gain_db(wav)
                 cmd = build_audio_cmd(
                     audio_path=wav, master_out=self._a_master,
                     audio_bitrate=self._audio_bitrate, loudnorm=self._loudnorm,
                     preview_out=self._a_preview, compact_out=self._a_compact,
                     total_dur_s=self._total_dur_s,
                     preview_lead=self._preview_lead,
-                    end_samples=self._end_samples)
+                    end_samples=self._end_samples,
+                    mix_gain_db=self.mix_gain_db)
                 with self._lock:
                     if self._cancelled:
                         try:

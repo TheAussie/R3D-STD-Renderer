@@ -21,7 +21,9 @@ encoder speed can't shift audio (the property §5.2 guards).
 from __future__ import annotations
 
 import hashlib
+import math
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -173,6 +175,97 @@ def _loudnorm_cache_store(cache_path: Path, raw: bytes) -> None:
         pass
 
 
+# --- loudness by ONE fixed gain (R3D_STD_FIXED_GAIN=1 in the CLI; default OFF) -
+# The one-pass `loudnorm` filter is all of the audio's cost: 17.5 s for a 482 s
+# song that takes 0.5 s to decode (it works at 192 kHz, on one thread). It runs
+# on the song at decode and again on the preview's audio in every render. With
+# the switch each of those is replaced by: measure the integrated loudness
+# (ffmpeg `ebur128`, EBU R128) at the same point in the chain, then ONE gain for
+# the whole track that brings it to the same -18 LUFS, held back where it would
+# put a sample above the same -1.5 dB. Decode + measure: 0.75 s for that song.
+# NOT the same sound: one-pass loudnorm moves its gain as the track goes (it
+# lifts quiet passages); a fixed gain leaves the track's own dynamics alone.
+TARGET_LUFS = -18.0
+PEAK_CEILING_DB = -1.5
+_EBUR128 = "ebur128=framelog=quiet"
+# what the cache key says instead of the loudnorm string: its own entries
+FIXED_GAIN_PARAM = f"fixedgain:I={TARGET_LUFS:g}:P={PEAK_CEILING_DB:g}"
+MIX_LIMITER = "alimiter=limit=0.95:level=disabled:attack=1:release=20"
+_MIX_LIMIT = 0.95
+
+
+_NOTHING_LUFS = -70.0          # what ebur128 reports when nothing passed its gate
+
+
+_PIN_192K = "aformat=sample_rates=192000"
+
+
+def fixed_gain_chain(rate_filters: str) -> str:
+    """The `-af` chain of the measuring decode: the rate filters, then the
+    measurement where loudnorm stood.
+
+    loudnorm only takes 192 kHz, and with it in the chain ffmpeg resamples to
+    192 kHz BEFORE an `atempo` (DT/HT), so the stock time-stretch runs at
+    192 kHz. Stretched at the file's own rate the song is a different (equally
+    valid) stretch: another length by a few ms and not sample-aligned with
+    stock's. Pinning the same rate at the same place keeps the stretch exactly
+    stock's, so the only thing the switch changes is the loudness. Measured:
+    with the pin the 1.5x and 0.75x songs match stock's length to the sample
+    and correlate 0.999+ at lag 0; without it 0.2-0.35. Chains without atempo
+    come out the same either way, so they skip the pin and its cost."""
+    parts = [rate_filters] if rate_filters else []
+    if "atempo" in rate_filters:
+        parts.append(_PIN_192K)
+    return ",".join(parts + [_EBUR128])
+
+
+def parse_integrated_lufs(stderr_text: str) -> "float | None":
+    """The integrated loudness out of ffmpeg's `ebur128` summary. None when
+    there is no summary to read (the caller then keeps the stock filter);
+    silence reads -70.0."""
+    m = re.findall(r"^\s*I:\s+(-?\d+(?:\.\d+)?) LUFS", stderr_text, re.M)
+    return float(m[-1]) if m else None
+
+
+def fixed_gain_db(integrated_lufs: "float | None", peak: float) -> float:
+    """dB for the whole track: up or down to TARGET_LUFS, but never so far up
+    that the loudest sample (`peak`, linear) passes PEAK_CEILING_DB. Silence
+    (nothing measured) is left as it is."""
+    if integrated_lufs is None or integrated_lufs <= _NOTHING_LUFS:
+        return 0.0
+    gain = TARGET_LUFS - integrated_lufs
+    if peak > 0.0:
+        gain = min(gain, PEAK_CEILING_DB - 20.0 * math.log10(peak))
+    return gain
+
+
+def mix_gain_db(wav_path: Path) -> "float | None":
+    """The fixed gain that stands in for `loudnorm` on the FINISHED mix (the
+    preview and Discord copy branch of the encode): measured behind the same
+    limiter that branch sits behind. None = could not be measured, and the
+    caller keeps the stock filter."""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        return None
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-nostats", "-loglevel", "info",
+             "-i", str(wav_path), "-af", f"{MIX_LIMITER},{_EBUR128}",
+             "-f", "null", "-"], capture_output=True, check=False)
+        if proc.returncode != 0:
+            return None
+        lufs = parse_integrated_lufs(proc.stderr.decode(errors="replace"))
+        if lufs is None or lufs <= _NOTHING_LUFS:
+            return None
+        # write_wav's file: a 44-byte header, then float32 samples
+        pcm = np.memmap(wav_path, dtype="<f4", mode="r", offset=44)
+        peak = float(np.abs(pcm).max()) if pcm.size else 0.0
+        del pcm
+    except (OSError, ValueError):
+        return None
+    return fixed_gain_db(lufs, min(peak, _MIX_LIMIT))
+
+
 def rate_audio_filter(rate: float, pitch: bool = False) -> str:
     """The ffmpeg ``-af`` filter string for a clock-rate change → "" at rate 1.
 
@@ -207,16 +300,22 @@ def rate_audio_filter(rate: float, pitch: bool = False) -> str:
 
 
 def decode_to_pcm(path: Path, *, rate: float = 1.0,
-                  pitch: bool = False, loudnorm: bool = False) -> np.ndarray:
+                  pitch: bool = False, loudnorm: bool = False,
+                  fixed_gain: bool = False) -> np.ndarray:
     """Decode any audio file → float32 stereo 48 kHz, shape (N, 2).
 
     `rate` != 1 applies the clock-rate change. `pitch=False` (DT/HT) is a
     pitch-preserving tempo change; `pitch=True` (NC/DC) shifts the pitch with
-    the rate (nightcore/daycore). See :func:`rate_audio_filter`."""
+    the rate (nightcore/daycore). See :func:`rate_audio_filter`.
+
+    `fixed_gain` (with `loudnorm`; R3D_STD_FIXED_GAIN=1 in the CLI) brings the
+    track to the same loudness with one measured gain instead of the one-pass
+    filter: see the note above `fixed_gain_db`."""
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise AudioError("ffmpeg not found on PATH")
     af = rate_audio_filter(rate, pitch)
+    fixed = bool(loudnorm and fixed_gain)
 
     # LOUDNORM PCM CACHE: the loudnorm pass is deterministic in its input yet
     # reruns the full ffmpeg decode+normalise on every render of the same track.
@@ -229,8 +328,12 @@ def decode_to_pcm(path: Path, *, rate: float = 1.0,
         try:
             _cdir = _loudnorm_cache_dir()
             if _cdir is not None:
-                key = _loudnorm_cache_key(Path(path), rate, pitch,
-                                          _LOUDNORM_FILTER)
+                cache_param = FIXED_GAIN_PARAM if fixed else _LOUDNORM_FILTER
+                if fixed and "atempo" in af:
+                    # Older fixed-gain entries used the native-rate stretch.
+                    # They must not bypass the corrected 192 kHz chain.
+                    cache_param += ":atempo192k"
+                key = _loudnorm_cache_key(Path(path), rate, pitch, cache_param)
                 cache_path = _cdir / f"{key}.{_CACHE_EXT}"
         except OSError:
             cache_path = None  # can't hash the source -> just decode uncached
@@ -240,7 +343,13 @@ def decode_to_pcm(path: Path, *, rate: float = 1.0,
                 return cached
 
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(path)]
-    if loudnorm:
+    if fixed:
+        # measured where loudnorm stood: after the rate change, on the stream
+        # as it was decoded. `info` is the level ebur128 prints its summary at.
+        cmd = [ffmpeg, "-hide_banner", "-nostats", "-loglevel", "info",
+               "-i", str(path)]
+        af = fixed_gain_chain(af)
+    elif loudnorm:
         # LOUDNORM DUCK FIX (#17): normalise the MUSIC ALONE here (music-only,
         # no hit transients) so the encode does NOT loudnorm the song+hits mix
         # (that ducked the song ~4 dB under every hitsound). Hits are numpy-mixed
@@ -254,6 +363,24 @@ def decode_to_pcm(path: Path, *, rate: float = 1.0,
     if proc.returncode != 0:
         raise AudioError(f"ffmpeg decode failed: "
                          f"{proc.stderr.decode(errors='replace')[-500:]}")
+    if fixed:
+        pcm = np.frombuffer(proc.stdout, dtype=np.float32) \
+            .reshape(-1, CHANNELS).copy()
+        lufs = parse_integrated_lufs(proc.stderr.decode(errors="replace"))
+        if lufs is None:
+            # this ffmpeg printed no summary we can read: the stock filter
+            print("[std] song loudness: no ebur128 summary from this ffmpeg, "
+                  "using the loudnorm filter", file=sys.stderr, flush=True)
+            return decode_to_pcm(path, rate=rate, pitch=pitch, loudnorm=True)
+        gain = fixed_gain_db(lufs, float(np.abs(pcm).max()) if pcm.size else 0.0)
+        pcm *= np.float32(10.0 ** (gain / 20.0))
+        print("[std] song loudness: "
+              + ("silent, left as it is" if lufs <= _NOTHING_LUFS else
+                 f"{lufs:.1f} LUFS, one gain of {gain:+.1f} dB"),
+              file=sys.stderr, flush=True)
+        if cache_path is not None:
+            _loudnorm_cache_store(cache_path, pcm.tobytes())
+        return pcm
     if cache_path is not None:
         _loudnorm_cache_store(cache_path, proc.stdout)
     pcm = np.frombuffer(proc.stdout, dtype=np.float32)

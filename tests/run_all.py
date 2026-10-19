@@ -117,6 +117,9 @@ MODULES = [
     "tests.test_metal",
     # audio prepared beside the frame loop (R3D_STD_AUDIO_LATE, default off)
     "tests.test_audio_late",
+    # loudness by one measured gain in place of the one-pass loudnorm filter
+    # (R3D_STD_FIXED_GAIN, default off)
+    "tests.test_fixed_gain",
 ]
 
 

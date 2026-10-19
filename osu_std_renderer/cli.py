@@ -703,6 +703,16 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
     # args, same bytes; an AudioError from the worker surfaces at .result()
     # inside the existing try. Skipped for --dump-frames (it never reaches
     # the audio section).
+    # LOUDNESS BY ONE FIXED GAIN (R3D_STD_FIXED_GAIN=1, default OFF): wherever
+    # the one-pass loudnorm filter runs (on the song here, on the preview's
+    # audio in the encode) the loudness is measured and one gain is applied
+    # instead: 0.75 s against 17.6 s for a 482 s song this node has not
+    # rendered before. It is a different sound (the track's own dynamics are
+    # kept), which is why it is a switch. See record/audio.py. The node-wide
+    # R3D_FIXED_GAIN=1 turns it on in every engine; std's own switch wins.
+    fixed_gain = (perf.envflag("R3D_STD_FIXED_GAIN",
+                               perf.envflag("R3D_FIXED_GAIN"))
+                  and not perf.STOCK)
     _audio_afile = beatmap.get_audio_file(beatmap_dir)
     _audio_fut = None
     if _audio_afile is not None and not args.dump_frames:
@@ -711,11 +721,13 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
         if meta is not None and meta.has_rate_ramp:
             # WU/WD decodes NATIVE (rate 1) and warps piecewise at collect
             _audio_fut = _audio_pool.submit(decode_to_pcm, _audio_afile,
-                                            rate=1.0, loudnorm=True)
+                                            rate=1.0, loudnorm=True,
+                                            fixed_gain=fixed_gain)
         else:
             _audio_fut = _audio_pool.submit(
                 decode_to_pcm, _audio_afile, rate=beatmap.diff.speed,
-                pitch=(meta is not None and meta.rate_pitch), loudnorm=True)
+                pitch=(meta is not None and meta.rate_pitch), loudnorm=True,
+                fixed_gain=fixed_gain)
         _audio_pool.shutdown(wait=False)
 
     perf.mark("setup:real_skin_core")
@@ -1251,7 +1263,8 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
                     from .record.audio import warp_music_pcm
                     _amark("aud:pcm_join", leaf=True)
                     pcm = (_audio_fut.result() if _audio_fut is not None
-                           else decode_to_pcm(afile, rate=1.0, loudnorm=True))
+                           else decode_to_pcm(afile, rate=1.0, loudnorm=True,
+                                              fixed_gain=fixed_gain))
                     pcm = warp_music_pcm(pcm, warp,
                                          adjust_pitch=meta.ramp_pitch)
                 else:
@@ -1263,7 +1276,8 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
                            else decode_to_pcm(
                                afile, rate=speed,
                                pitch=(meta is not None and meta.rate_pitch),
-                               loudnorm=True))
+                               loudnorm=True,
+                               fixed_gain=fixed_gain))
                 # the map-time render start lands at wall t=0: the (already
                 # rate-adjusted / ramp-warped) music is laid at the wall position
                 # of map time 0 — mix_at clips a negative head; a pre-roll delays
@@ -1468,7 +1482,8 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
         (output.parent / (output.stem + ".stream.json")).write_text(_json.dumps(
             {"schema": 1, "faststart": False,
              "loudnorm": "loudnorm=I=-18:TP=-1.5:LRA=11",
-             "compact": compact_path is not None}))
+             "compact": compact_path is not None,
+             **({"loudness": "fixed-gain"} if fixed_gain else {})}))
         print("[std] streamable master (no faststart, loudnorm in-engine)",
               file=sys.stderr, flush=True)
     perf.mark("aud:encoder_spawn")
@@ -1496,7 +1511,19 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
                          compact_path=compact_path, mix=_mix_audio,
                          total_dur_s=total_wall_ms / 1000.0,
                          preview_lead=_preview_hw, loudnorm=False,
-                         end_samples=_ends)
+                         end_samples=_ends, fixed_gain=fixed_gain)
+    _mix_gain = None
+    if (fixed_gain and audio_path is not None
+            and (preview_path is not None or stream_master)):
+        # the encode would run loudnorm on the finished mix: measure it once
+        # (0.5 s) and hand over the gain. Not measurable = the stock filter.
+        from .record.audio import mix_gain_db
+        perf.mark("aud:mix_loudness")
+        _mix_gain = mix_gain_db(audio_path)
+        print("[std] mix loudness: "
+              + ("not measurable, the loudnorm filter stays" if _mix_gain is None
+                 else f"one gain of {_mix_gain:+.2f} dB in place of loudnorm"),
+              file=sys.stderr, flush=True)
     cmd = build_ffmpeg_cmd(
         encoder=encoder, resolution=(w, h), fps=settings.fps,
         output_path=output if late is None else late.video_master,
@@ -1511,7 +1538,8 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
         stream_master=stream_master,
         compact_path=compact_path if late is None else late.video_compact,
         preview_hw=_preview_hw,
-        faststart=late is None)
+        faststart=late is None,
+        mix_gain_db=_mix_gain)
 
     last_pct = [-1]
     render_complete = False
@@ -1566,6 +1594,10 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
                      f" (frames {n_frames}, expected {_n_pred}: the audio "
                      f"ends {abs(n_frames - _n_pred)} frame(s) off)"),
                   file=sys.stderr, flush=True)
+            if fixed_gain and late.mix_gain_db is not None:
+                print(f"[std] mix loudness: one gain of "
+                      f"{late.mix_gain_db:+.2f} dB in place of loudnorm",
+                      file=sys.stderr, flush=True)
         render_complete = True
         progress(1.0)
     finally:
