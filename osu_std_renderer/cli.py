@@ -1229,193 +1229,212 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
         def m2w(m: float) -> float:
             return (m - render_start_ms) / speed
 
-    audio_path = None
-    perf.mark("aud:mixer")
-    mixer = AudioMixer(m2w(end_ms))
-    have_audio = False
-    afile = _audio_afile
-    if afile is not None:
-        try:
-            vol = ((settings.music_volume / 100.0)
-                   * (settings.general_volume / 100.0))
-            if warp is not None:
-                # WU/WD: the rate ramps, so a single atempo/asetrate can't warp
-                # the track — decode NATIVE and warp piecewise (record/audio.
-                # warp_music_pcm). adjust_pitch True (WU/WD default) shifts
-                # pitch with the rate; False keeps pitch (tempo-only).
-                from .record.audio import warp_music_pcm
-                perf.mark("aud:pcm_join", leaf=True)
-                pcm = (_audio_fut.result() if _audio_fut is not None
-                       else decode_to_pcm(afile, rate=1.0, loudnorm=True))
-                pcm = warp_music_pcm(pcm, warp,
-                                     adjust_pitch=meta.ramp_pitch)
-            else:
-                # NC/DC pitch the music with the rate; DT/HT (and every
-                # standard/bitmask rate, where rate_pitch is False) change
-                # tempo only. (Decoded off-thread above — same args.)
-                perf.mark("aud:pcm_join", leaf=True)
-                pcm = (_audio_fut.result() if _audio_fut is not None
-                       else decode_to_pcm(
-                           afile, rate=speed,
-                           pitch=(meta is not None and meta.rate_pitch),
-                           loudnorm=True))
-            # the map-time render start lands at wall t=0: the (already
-            # rate-adjusted / ramp-warped) music is laid at the wall position
-            # of map time 0 — mix_at clips a negative head; a pre-roll delays
-            # it instead
-            perf.mark("aud:lay_music")
-            mixer.lay_music(pcm, m2w(0.0), volume=vol)
-            have_audio = True
-        except AudioError as e:
-            print(f"WARNING: music decode failed, mixing without the music "
-                  f"bed: {e}", file=sys.stderr)
-    else:
-        print(f"WARNING: beatmap audio '{beatmap.audio}' not found — "
-              "mixing without the music bed", file=sys.stderr)
-
-    # sample bank shared by judged hitsounds + the nightcore overlay(s);
-    # the synth-default bank follows the visual league (skinless→argon,
-    # custom-skin gaps→legacy, --legacy-defaults→legacy)
-    # ModNightcore beat overlay is AUTOMATIC when the NC mod (bit 512) is on.
-    _nc_mod = bool(int(getattr(meta, "mods", 0) or 0) & 512) if meta is not None else False
-    sample_bank = None
-    if settings.hitsound_volume > 0 and settings.general_volume > 0 and (
-            (settings.use_replay_hitsounds and judgments is not None)
-            or settings.nightcore_hitsounds or _nc_mod):
-        from .record.hitsounds import SampleBank, synth_style_for
-        from .skin.skin import Skin as SampleSkin
-        sample_skin = SampleSkin(skin_dir=settings.skin_dir,
-                                 fallback_dir=settings.default_skin_dir)
-        perf.mark("aud:sample_bank")
-        sample_bank = SampleBank(
-            skin=sample_skin, beatmap_dir=beatmap_dir,
-            use_beatmap_samples=not settings.use_skin_hitsounds,
-            synth_style=synth_style_for(settings.skin_dir is not None,
-                                        settings.legacy_defaults))
-    # -8 LU hit ceiling (2026-07-31): std per-note hits had NO attenuation
-    # (rode at full volume x1.0) — the loudest in-house engine. Scale them to
-    # match the -18 LUFS music loudnorm drop (mirrors catch/mania 0.55->0.22).
-    HIT_CEILING = 0.40
-    hs_gain = (HIT_CEILING
-               * (settings.hitsound_volume / 100.0)
-               * (settings.general_volume / 100.0))
-
-    # §3.4 hitsounds: one-shots at judged hit times + slide/spin loops,
-    # resolved BEATMAP(custom index) → skin chain → synthesized defaults
-    if (settings.use_replay_hitsounds and judgments is not None
-            and sample_bank is not None):
-        from .record.hitsounds import collect_hitsound_events, mix_hitsounds
-        perf.mark("aud:collect_hs")
-        oneshots, loops = collect_hitsound_events(
-            beatmap, judgments, layered=skin_info.layered_hit_sounds)
-        if fail_time is not None:
-            # FAIL: objects after the death point were never played — drop
-            # their hitsounds (loops clip at the death point)
-            oneshots = [o for o in oneshots if o.time_ms < fail_time]
-            loops = [l for l in loops if l.t0 < fail_time]
-        perf.mark("aud:mix_hitsounds", leaf=True)
-        stats = mix_hitsounds(mixer, sample_bank, oneshots, loops,
-                              speed=speed, start_ms=render_start_ms,
-                              gain=hs_gain,
-                              to_wall=(m2w if warp is not None else None))
-        srcs = sample_bank.source_counts()
-        perf.mark("aud:hs_report")
-        print(f"hitsounds: {stats.oneshots} one-shots, "
-              f"{stats.loop_ms / 1000.0:.1f}s loops | samples: "
-              f"beatmap {srcs['beatmap']}, skin {srcs['skin']}, "
-              f"synth {srcs['synth']} ({sample_bank.synth_style} bank) | "
-              f"track peak "
-              f"{stats.peak_before:.2f}→{stats.peak_after:.2f}",
-              file=sys.stderr)
-        have_audio = have_audio or stats.oneshots > 0 or stats.loop_ms > 0
-
-    # Beat overlays stop at gameplay END, not into the fail-anim/results outro
-    # (taiko fix ac73af2): on a FAIL gameplay ends at the death point, so cap the
-    # overlay horizon at fail_time (the one-shot hits are already truncated there).
-    # On a pass last_end (< the results screen) is already the correct bound.
-    _overlay_end = fail_time if fail_time is not None else last_end
-
-    # §4.4 general beat-overlay metronome: clap each beat + finish each downbeat
-    # across [render start, gameplay end]. SUPPRESSED while NC is active (the NC
-    # drum overlay below plays instead — osu! never plays both).
-    if settings.nightcore_hitsounds and not _nc_mod and sample_bank is not None:
-        from .record.hitsounds import mix_nightcore, nightcore_beats
-        beats = nightcore_beats(beatmap.timings,
-                                max(render_start_ms, 0.0), _overlay_end)
-        laid = mix_nightcore(mixer, sample_bank, beats, speed=speed,
-                             start_ms=render_start_ms, gain=hs_gain,
-                             to_wall=(m2w if warp is not None else None))
-        downs = sum(1 for _, d in beats if d)
-        print(f"nightcore: {laid} beats laid ({downs} downbeats)",
-              file=sys.stderr)
-        have_audio = have_audio or laid > 0
-
-    # ModNightcore beat overlay — AUTOMATIC when the Nightcore mod is active:
-    # the kick(1,3)/clap(2,4)/hat(off-beats)/finish(every 4th bar) drum pattern
-    # from the SKIN's nightcore-* samples on the (sped-up) beat grid. Distinct
-    # from + independent of the nightcore_hitsounds general metronome above
-    # (both lay if that toggle is on for an NC play). Hats gate on
-    # SliderTickRate%2==0 (osu!).
-    if _nc_mod and sample_bank is not None:
-        from .record.hitsounds import mix_nightcore_mod, nightcore_mod_events
-        _play_hats = (int(round(beatmap.timings.tick_rate)) % 2 == 0)
-        nc_events = nightcore_mod_events(beatmap.timings,
-                                         max(render_start_ms, 0.0), _overlay_end,
-                                         play_hats=_play_hats)
-        nc_laid = mix_nightcore_mod(mixer, sample_bank, nc_events, speed=speed,
-                                    start_ms=render_start_ms, gain=hs_gain,
-                                    to_wall=(m2w if warp is not None else None))
-        print(f"nightcore-mod: {nc_laid} NC beat samples laid "
-              f"(hats {'on' if _play_hats else 'off'})", file=sys.stderr)
-        have_audio = have_audio or nc_laid > 0
-
-    # §4.10 pre-roll audio: the seizure card / lead-in region is SILENT
-    # (danser LeadInTime semantics) — for a map-start render the region
-    # is silent anyway; this also covers --start clips with a pre-roll
-    if have_audio and (seizure_ms or lead_ms):
-        perf.mark("aud:post_fx")
-        mixer.silence_before(m2w(start_ms))
-
-    # §4.10 FadeOutTime, audio side.
-    if have_audio and fail_time is None:
-        if results is None:
-            # No outro: the video ends on the map-end fade, so the music
-            # fades to black with it (§4.10 FadeOutTime — unchanged).
-            if fade_len_ms > 0.0:
-                mixer.fade_out(m2w(fade_start_ms), m2w(gameplay_end_ms))
+    def _mix_audio(_amark=perf.mark):
+        """The offline mix: music bed + hitsounds, written to a wav. Returns
+        its path, or None for a silent render. A function only so that
+        R3D_STD_AUDIO_LATE can run it beside the frame loop; otherwise it is
+        called right here, as the inline code it always was."""
+        audio_path = None
+        _amark("aud:mixer")
+        mixer = AudioMixer(m2w(end_ms))
+        have_audio = False
+        afile = _audio_afile
+        if afile is not None:
+            try:
+                vol = ((settings.music_volume / 100.0)
+                       * (settings.general_volume / 100.0))
+                if warp is not None:
+                    # WU/WD: the rate ramps, so a single atempo/asetrate can't warp
+                    # the track — decode NATIVE and warp piecewise (record/audio.
+                    # warp_music_pcm). adjust_pitch True (WU/WD default) shifts
+                    # pitch with the rate; False keeps pitch (tempo-only).
+                    from .record.audio import warp_music_pcm
+                    _amark("aud:pcm_join", leaf=True)
+                    pcm = (_audio_fut.result() if _audio_fut is not None
+                           else decode_to_pcm(afile, rate=1.0, loudnorm=True))
+                    pcm = warp_music_pcm(pcm, warp,
+                                         adjust_pitch=meta.ramp_pitch)
+                else:
+                    # NC/DC pitch the music with the rate; DT/HT (and every
+                    # standard/bitmask rate, where rate_pitch is False) change
+                    # tempo only. (Decoded off-thread above — same args.)
+                    _amark("aud:pcm_join", leaf=True)
+                    pcm = (_audio_fut.result() if _audio_fut is not None
+                           else decode_to_pcm(
+                               afile, rate=speed,
+                               pitch=(meta is not None and meta.rate_pitch),
+                               loudnorm=True))
+                # the map-time render start lands at wall t=0: the (already
+                # rate-adjusted / ramp-warped) music is laid at the wall position
+                # of map time 0 — mix_at clips a negative head; a pre-roll delays
+                # it instead
+                _amark("aud:lay_music")
+                mixer.lay_music(pcm, m2w(0.0), volume=vol)
+                have_audio = True
+            except AudioError as e:
+                print(f"WARNING: music decode failed, mixing without the music "
+                      f"bed: {e}", file=sys.stderr)
         else:
-            # Results outro present: the song KEEPS PLAYING under the
-            # results screen (osu!/lazer behaviour) up to its natural end,
-            # with a short fade at the very end of the video so the cut is
-            # clean (parity with mania v2's 600 ms tail fade).
-            tail = m2w(end_ms)
-            mixer.fade_out(max(0.0, tail - 600.0), tail)
+            print(f"WARNING: beatmap audio '{beatmap.audio}' not found — "
+                  "mixing without the music bed", file=sys.stderr)
 
-    # FAIL audio: the FailAnimation bends the track frequency to 0 over the
-    # 2500 ms fall (a slowdown + pitch drop). We can't pitch-bend offline
-    # without BASS, so we APPROXIMATE with a linear music fade to silence
-    # across the fall (honest gap: no pitch-bend), and play the synthesized
-    # fail sample once at the death point (FailAnimation.failSample.Play).
-    if fail_time is not None and settings.general_volume > 0:
-        from .record.hitsounds import synth_failsound
-        t0 = m2w(fail_time)
-        t1 = m2w(fail_time + fail_anim_len_ms)
+        # sample bank shared by judged hitsounds + the nightcore overlay(s);
+        # the synth-default bank follows the visual league (skinless→argon,
+        # custom-skin gaps→legacy, --legacy-defaults→legacy)
+        # ModNightcore beat overlay is AUTOMATIC when the NC mod (bit 512) is on.
+        _nc_mod = bool(int(getattr(meta, "mods", 0) or 0) & 512) if meta is not None else False
+        sample_bank = None
+        if settings.hitsound_volume > 0 and settings.general_volume > 0 and (
+                (settings.use_replay_hitsounds and judgments is not None)
+                or settings.nightcore_hitsounds or _nc_mod):
+            from .record.hitsounds import SampleBank, synth_style_for
+            from .skin.skin import Skin as SampleSkin
+            sample_skin = SampleSkin(skin_dir=settings.skin_dir,
+                                     fallback_dir=settings.default_skin_dir)
+            _amark("aud:sample_bank")
+            sample_bank = SampleBank(
+                skin=sample_skin, beatmap_dir=beatmap_dir,
+                use_beatmap_samples=not settings.use_skin_hitsounds,
+                synth_style=synth_style_for(settings.skin_dir is not None,
+                                            settings.legacy_defaults))
+        # -8 LU hit ceiling (2026-07-31): std per-note hits had NO attenuation
+        # (rode at full volume x1.0) — the loudest in-house engine. Scale them to
+        # match the -18 LUFS music loudnorm drop (mirrors catch/mania 0.55->0.22).
+        HIT_CEILING = 0.40
+        hs_gain = (HIT_CEILING
+                   * (settings.hitsound_volume / 100.0)
+                   * (settings.general_volume / 100.0))
+
+        # §3.4 hitsounds: one-shots at judged hit times + slide/spin loops,
+        # resolved BEATMAP(custom index) → skin chain → synthesized defaults
+        if (settings.use_replay_hitsounds and judgments is not None
+                and sample_bank is not None):
+            from .record.hitsounds import collect_hitsound_events, mix_hitsounds
+            _amark("aud:collect_hs")
+            oneshots, loops = collect_hitsound_events(
+                beatmap, judgments, layered=skin_info.layered_hit_sounds)
+            if fail_time is not None:
+                # FAIL: objects after the death point were never played — drop
+                # their hitsounds (loops clip at the death point)
+                oneshots = [o for o in oneshots if o.time_ms < fail_time]
+                loops = [l for l in loops if l.t0 < fail_time]
+            _amark("aud:mix_hitsounds", leaf=True)
+            stats = mix_hitsounds(mixer, sample_bank, oneshots, loops,
+                                  speed=speed, start_ms=render_start_ms,
+                                  gain=hs_gain,
+                                  to_wall=(m2w if warp is not None else None))
+            srcs = sample_bank.source_counts()
+            _amark("aud:hs_report")
+            print(f"hitsounds: {stats.oneshots} one-shots, "
+                  f"{stats.loop_ms / 1000.0:.1f}s loops | samples: "
+                  f"beatmap {srcs['beatmap']}, skin {srcs['skin']}, "
+                  f"synth {srcs['synth']} ({sample_bank.synth_style} bank) | "
+                  f"track peak "
+                  f"{stats.peak_before:.2f}→{stats.peak_after:.2f}",
+                  file=sys.stderr)
+            have_audio = have_audio or stats.oneshots > 0 or stats.loop_ms > 0
+
+        # Beat overlays stop at gameplay END, not into the fail-anim/results outro
+        # (taiko fix ac73af2): on a FAIL gameplay ends at the death point, so cap the
+        # overlay horizon at fail_time (the one-shot hits are already truncated there).
+        # On a pass last_end (< the results screen) is already the correct bound.
+        _overlay_end = fail_time if fail_time is not None else last_end
+
+        # §4.4 general beat-overlay metronome: clap each beat + finish each downbeat
+        # across [render start, gameplay end]. SUPPRESSED while NC is active (the NC
+        # drum overlay below plays instead — osu! never plays both).
+        if settings.nightcore_hitsounds and not _nc_mod and sample_bank is not None:
+            from .record.hitsounds import mix_nightcore, nightcore_beats
+            beats = nightcore_beats(beatmap.timings,
+                                    max(render_start_ms, 0.0), _overlay_end)
+            laid = mix_nightcore(mixer, sample_bank, beats, speed=speed,
+                                 start_ms=render_start_ms, gain=hs_gain,
+                                 to_wall=(m2w if warp is not None else None))
+            downs = sum(1 for _, d in beats if d)
+            print(f"nightcore: {laid} beats laid ({downs} downbeats)",
+                  file=sys.stderr)
+            have_audio = have_audio or laid > 0
+
+        # ModNightcore beat overlay — AUTOMATIC when the Nightcore mod is active:
+        # the kick(1,3)/clap(2,4)/hat(off-beats)/finish(every 4th bar) drum pattern
+        # from the SKIN's nightcore-* samples on the (sped-up) beat grid. Distinct
+        # from + independent of the nightcore_hitsounds general metronome above
+        # (both lay if that toggle is on for an NC play). Hats gate on
+        # SliderTickRate%2==0 (osu!).
+        if _nc_mod and sample_bank is not None:
+            from .record.hitsounds import mix_nightcore_mod, nightcore_mod_events
+            _play_hats = (int(round(beatmap.timings.tick_rate)) % 2 == 0)
+            nc_events = nightcore_mod_events(beatmap.timings,
+                                             max(render_start_ms, 0.0), _overlay_end,
+                                             play_hats=_play_hats)
+            nc_laid = mix_nightcore_mod(mixer, sample_bank, nc_events, speed=speed,
+                                        start_ms=render_start_ms, gain=hs_gain,
+                                        to_wall=(m2w if warp is not None else None))
+            print(f"nightcore-mod: {nc_laid} NC beat samples laid "
+                  f"(hats {'on' if _play_hats else 'off'})", file=sys.stderr)
+            have_audio = have_audio or nc_laid > 0
+
+        # §4.10 pre-roll audio: the seizure card / lead-in region is SILENT
+        # (danser LeadInTime semantics) — for a map-start render the region
+        # is silent anyway; this also covers --start clips with a pre-roll
+        if have_audio and (seizure_ms or lead_ms):
+            _amark("aud:post_fx")
+            mixer.silence_before(m2w(start_ms))
+
+        # §4.10 FadeOutTime, audio side.
+        if have_audio and fail_time is None:
+            if results is None:
+                # No outro: the video ends on the map-end fade, so the music
+                # fades to black with it (§4.10 FadeOutTime — unchanged).
+                if fade_len_ms > 0.0:
+                    mixer.fade_out(m2w(fade_start_ms), m2w(gameplay_end_ms))
+            else:
+                # Results outro present: the song KEEPS PLAYING under the
+                # results screen (osu!/lazer behaviour) up to its natural end,
+                # with a short fade at the very end of the video so the cut is
+                # clean (parity with mania v2's 600 ms tail fade).
+                tail = m2w(end_ms)
+                mixer.fade_out(max(0.0, tail - 600.0), tail)
+
+        # FAIL audio: the FailAnimation bends the track frequency to 0 over the
+        # 2500 ms fall (a slowdown + pitch drop). We can't pitch-bend offline
+        # without BASS, so we APPROXIMATE with a linear music fade to silence
+        # across the fall (honest gap: no pitch-bend), and play the synthesized
+        # fail sample once at the death point (FailAnimation.failSample.Play).
+        if fail_time is not None and settings.general_volume > 0:
+            from .record.hitsounds import synth_failsound
+            t0 = m2w(fail_time)
+            t1 = m2w(fail_time + fail_anim_len_ms)
+            if have_audio:
+                mixer.fade_out(t0, t1)
+            fs_vol = settings.general_volume / 100.0
+            mixer.mix_at(t0, synth_failsound(), volume=fs_vol)
+            have_audio = True
+            print(f"fail:   music fades {t0 / 1000.0:.1f}→{t1 / 1000.0:.1f}s "
+                  f"(wall) + fail sample at {t0 / 1000.0:.1f}s "
+                  f"(pitch-bend approximated)", file=sys.stderr)
+
         if have_audio:
-            mixer.fade_out(t0, t1)
-        fs_vol = settings.general_volume / 100.0
-        mixer.mix_at(t0, synth_failsound(), volume=fs_vol)
-        have_audio = True
-        print(f"fail:   music fades {t0 / 1000.0:.1f}→{t1 / 1000.0:.1f}s "
-              f"(wall) + fail sample at {t0 / 1000.0:.1f}s "
-              f"(pitch-bend approximated)", file=sys.stderr)
+            _amark("aud:write_wav")
+            audio_path = output.with_suffix(".audio.wav")
+            mixer.write_wav(audio_path)
+        else:
+            print("WARNING: no audio mixed — rendering SILENT video",
+                  file=sys.stderr)
+        return audio_path
 
-    if have_audio:
-        perf.mark("aud:write_wav")
-        audio_path = output.with_suffix(".audio.wav")
-        mixer.write_wav(audio_path)
-    else:
-        print("WARNING: no audio mixed — rendering SILENT video",
-              file=sys.stderr)
+    # AUDIO OFF THE START (R3D_STD_AUDIO_LATE=1, default OFF): draw and encode
+    # the video at once and prepare the audio beside the frame loop, instead
+    # of holding the first frame until the song is decoded and mixed (18 s for
+    # a 7.5 minute song this node has not rendered before). See
+    # record/audio_late.py. The streamable master and the live preview are
+    # uploaded while they are written, so they keep the stock order.
+    audio_late = (perf.envflag("R3D_STD_AUDIO_LATE") and not perf.STOCK
+                  and os.environ.get("R3D_STREAM_MASTER") != "1"
+                  and os.environ.get("R3D_PREVIEW_LIVE") != "1"
+                  and os.environ.get("R3D_STD_NULL_SINK") != "1"
+                  and not settings.audio_offset)
+    audio_path = None if audio_late else _mix_audio()
 
     total_wall_ms = m2w(end_ms)
     # INLINE PREVIEW (R3D_PREVIEW_INLINE=1, default OFF): have the SAME ffmpeg
@@ -1454,25 +1473,53 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
               file=sys.stderr, flush=True)
     perf.mark("aud:encoder_spawn")
     encoder = probe_encoder(settings.encoder, settings.encoder_device)
+    _preview_hw = preview_path is not None and preview_on_media_engine()
+    late = None
+    if audio_late:
+        from .record.audio_late import LateAudio, video_end_sample
+        from .record.encode import compact_plan
+        from .record.pipeline import predict_draw_times
+        # the frame count is known before the first frame (the loop's own
+        # arithmetic), and with it where `-shortest` would end each audio
+        _n_pred = sum(1 for _ in predict_draw_times(
+            settings.fps, render_start_ms, end_ms, speed,
+            warp.rate_at if warp is not None else None))
+        _pfps = min(30, int(round(float(settings.fps))))
+        _ends = {"master": video_end_sample(_n_pred, settings.fps),
+                 "preview": video_end_sample(_n_pred, settings.fps, _pfps)}
+        if compact_path is not None:
+            _ends["compact"] = video_end_sample(
+                _n_pred, settings.fps,
+                min(compact_plan(total_wall_ms / 1000.0)[3],
+                    int(round(float(settings.fps)))))
+        late = LateAudio(output=output, preview_path=preview_path,
+                         compact_path=compact_path, mix=_mix_audio,
+                         total_dur_s=total_wall_ms / 1000.0,
+                         preview_lead=_preview_hw, loudnorm=False,
+                         end_samples=_ends)
     cmd = build_ffmpeg_cmd(
         encoder=encoder, resolution=(w, h), fps=settings.fps,
-        output_path=output, audio_path=audio_path,
+        output_path=output if late is None else late.video_master,
+        audio_path=audio_path,
         audio_offset_ms=settings.audio_offset, loudnorm=False,
         video_bitrate=settings.video_bitrate,
         encoder_device=settings.encoder_device,
-        preview_path=preview_path,
+        preview_path=preview_path if late is None else late.video_preview,
         total_dur_s=(total_wall_ms / 1000.0 if preview_path is not None
                      else None),
         pix_fmt="yuv420p" if gl_mod._GPU_YUV else "rgb24",
         stream_master=stream_master,
-        compact_path=compact_path,
-        preview_hw=(preview_path is not None
-                    and preview_on_media_engine()))
+        compact_path=compact_path if late is None else late.video_compact,
+        preview_hw=_preview_hw,
+        faststart=late is None)
 
     last_pct = [-1]
+    render_complete = False
 
     def progress(frac: float) -> None:
         pct = int(frac * 100)
+        if late is not None and not render_complete:
+            pct = min(pct, 99)
         if pct != last_pct[0]:
             last_pct[0] = pct
             print(f"\rrendering… {pct}%", end="", file=sys.stderr, flush=True)
@@ -1495,6 +1542,11 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
     perf.mark("setup_done")
     t0 = time.monotonic()
     try:
+        if late is not None:
+            # Start only after setup succeeds and inside the cleanup guard.
+            late.start()
+            print("[std] audio off the start: the video does not wait for the mix",
+                  file=sys.stderr, flush=True)
         with FfmpegPipe(cmd, recycle=spr.recycle_frame) as pipe:
             n_frames = RecordPipeline(settings.fps, pipe.push,
                                       progress=progress).run(
@@ -1503,10 +1555,24 @@ def _render(args, settings: StdRenderSettings, beatmap, frames,
         # and ffmpeg reaped. Everything between drain_end and here is the
         # encoder tail, which is invisible to a frames/second number.
         perf.mark("encoder_done")
+        if late is not None:
+            _late_s = late.finish()
+            perf.mark("aud:late_joined")
+            if last_pct[0] >= 0:
+                print(file=sys.stderr, flush=True)
+            print(f"[std] audio off the start: audio was ready "
+                  f"{late.ready_s:.1f}s in, joined in {_late_s:.2f}s"
+                  + ("" if n_frames == _n_pred else
+                     f" (frames {n_frames}, expected {_n_pred}: the audio "
+                     f"ends {abs(n_frames - _n_pred)} frame(s) off)"),
+                  file=sys.stderr, flush=True)
+        render_complete = True
         progress(1.0)
     finally:
         if last_pct[0] >= 0:
             print(file=sys.stderr, flush=True)
+        if late is not None:
+            late.cleanup()
         if video_bg is not None:
             video_bg.close()
         if audio_path is not None:

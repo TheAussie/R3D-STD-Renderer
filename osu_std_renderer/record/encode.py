@@ -385,7 +385,7 @@ def compact_plan(total_dur_s: "float | None") -> "tuple[int, int, int, int]":
     return 720, maxrate, audio, 30
 
 
-def _preview_sink_args(preview_path) -> list:
+def _preview_sink_args(preview_path, faststart: bool = True) -> list:
     """Output arguments for the inline preview.
 
     Default: one faststart mp4 at ``preview_path`` (unchanged).
@@ -399,7 +399,7 @@ def _preview_sink_args(preview_path) -> list:
     segment is renamed into place only when it is complete, and is listed in
     the playlist only after that."""
     if os.environ.get("R3D_PREVIEW_LIVE") != "1":
-        return ["-movflags", "+faststart", str(preview_path)]
+        return (["-movflags", "+faststart"] if faststart else []) + [str(preview_path)]
     live_dir = str(preview_path)[:-len(".embed.mp4")] + ".live"
     os.makedirs(live_dir, exist_ok=True)
     for _old in os.listdir(live_dir):       # a retry must not show stale segments
@@ -426,7 +426,8 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
                      pix_fmt: str = "rgb24",
                      stream_master: bool = False,
                      compact_path: Path | None = None,
-                     preview_hw: bool = False) -> list[str]:
+                     preview_hw: bool = False,
+                     faststart: bool = True) -> list[str]:
     """rawvideo rgb24 on stdin → encoder → faststart mp4 (§5.6 shape).
 
     `preview_path` (INLINE PREVIEW, R3D_PREVIEW_INLINE=1 in the CLI; default
@@ -435,7 +436,10 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
     exactly as before. `total_dur_s` (video length, if known) only sizes the
     preview's bitrate. `preview_hw` (the caller passes
     `preview_on_media_engine()`) encodes that preview with VideoToolbox
-    instead of libx264; the master's arguments are the same either way."""
+    instead of libx264; the master's arguments are the same either way.
+    `faststart=False` (record/audio_late.py only) leaves the index at the end
+    of every output: those files are temporary and are rewritten once, when
+    the audio is joined to them."""
     w, h = resolution
     is_vaapi = encoder == "h264_vaapi"
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
@@ -511,7 +515,8 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
             af = af + [LOUDNORM]
         acodec = ["-c:a", "aac", "-b:a", audio_bitrate, "-ar", "48000",
                   "-shortest"]
-    _mfast = [] if stream_master else ["-movflags", "+faststart"]
+    _mfast = ([] if (stream_master or not faststart)
+              else ["-movflags", "+faststart"])
     if preview_path is None:
         cmd += ["-vf", _vf + ("," + _vm_tail if _vm_tail else "")]
         cmd += vc
@@ -608,7 +613,7 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
         # audio through or, once the audio is ended at the video's length (the
         # atrim above), cuts the last half second of VIDEO. The audio is ended
         # explicitly instead and the video ends when its frames do.
-    cmd += _preview_sink_args(preview_path)
+    cmd += _preview_sink_args(preview_path, faststart)
     if compact_path is not None:
         # output 3: the Discord copy. Same recipe as the node's own compact
         # encode (libx264 veryfast crf 21 + VBV at the plan's maxrate).
