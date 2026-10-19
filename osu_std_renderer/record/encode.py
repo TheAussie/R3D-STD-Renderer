@@ -22,11 +22,25 @@ import shutil
 import subprocess
 import sys
 import threading
+from decimal import Decimal, ROUND_FLOOR
 from pathlib import Path
 
 from ..render import perf
 
 LOUDNORM = "loudnorm=I=-18:TP=-1.5:LRA=11"
+
+
+def fixed_gain_filter(gain_db: float) -> str:
+    """Keep sub-microdB precision without rounding above the measured gain.
+
+    Rounding toward -infinity also protects a peak-limited attenuation from
+    becoming less negative. This is a sample-peak policy before AAC encoding,
+    not a guarantee about the encoded signal's true peak.
+    """
+    gain = Decimal.from_float(gain_db).quantize(
+        Decimal("0.000001"), rounding=ROUND_FLOOR)
+    return f"volume={gain:f}dB"
+
 
 # ---- x264 knobs behind env hooks (parity row 16) ----------------------------
 # taiko spells these R3D_X264_* and catch R3D_CATCH_X264_*; the un-prefixed form
@@ -445,7 +459,7 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
     wherever this command would run `loudnorm` on the mix; None leaves every
     one of them as it was."""
     w, h = resolution
-    _norm = LOUDNORM if mix_gain_db is None else f"volume={mix_gain_db:.2f}dB"
+    _norm = LOUDNORM if mix_gain_db is None else fixed_gain_filter(mix_gain_db)
     is_vaapi = encoder == "h264_vaapi"
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
     if is_vaapi:

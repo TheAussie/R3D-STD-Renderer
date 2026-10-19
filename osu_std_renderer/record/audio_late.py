@@ -24,7 +24,7 @@ import threading
 import time
 from pathlib import Path
 
-from .encode import LOUDNORM, compact_plan
+from .encode import LOUDNORM, compact_plan, fixed_gain_filter
 
 _QUIET = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
 
@@ -64,7 +64,7 @@ def build_audio_cmd(*, audio_path, master_out, audio_bitrate: str = "192k",
     output's audio where `-shortest` would have ended it beside its video
     (see video_end_sample). There is no video in this process to do it."""
     end_samples = end_samples or {}
-    _norm = LOUDNORM if mix_gain_db is None else f"volume={mix_gain_db:.2f}dB"
+    _norm = LOUDNORM if mix_gain_db is None else fixed_gain_filter(mix_gain_db)
 
     def _end(key: str) -> str:
         n = end_samples.get(key)

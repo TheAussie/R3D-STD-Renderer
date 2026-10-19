@@ -19,13 +19,15 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import tracemalloc
+from decimal import Decimal
 from pathlib import Path
 
 import numpy as np
 
 from osu_std_renderer.record import audio, audio_late, encode
 
-GAIN = "volume=-1.25dB"
+GAIN = "volume=-1.250000dB"
 
 
 def _cmd(**kw):
@@ -60,8 +62,7 @@ def test_the_gain_stands_where_loudnorm_stood_and_nothing_else_moves():
     g = _cmd(mix_gain_db=-1.25)
     g = g[g.index("-filter_complex") + 1]
     assert f"[aout]asplit=2[am][ap0];[ap0]{GAIN}[ap]" in g
-    # a positive gain is written with its sign, two decimals
-    assert any("volume=3.50dB" in a for a in _cmd(mix_gain_db=3.5))
+    assert any("volume=3.500000dB" in a for a in _cmd(mix_gain_db=3.5))
 
 
 def test_the_separate_audio_process_gets_the_same_gain():
@@ -91,6 +92,109 @@ def test_gain_arithmetic():
     assert abs(f(-7.6, 1.2) - (-10.4)) < 1e-9
     # silence (ebur128 reads -70) is left alone, and has no peak to hold it back
     assert f(None, 0.5) == 0.0 and f(-70.0, 0.5) == 0.0 and f(-18.0, 0.0) == 0.0
+
+
+def test_gain_serialization_never_rounds_above_the_measured_gain():
+    for gain in (-1.0544721057769548, 1.0544721057769548, -0.0000001,
+                 0.0000001, -1.25, 3.5, -4.1, 0.0):
+        applied = Decimal(encode.fixed_gain_filter(gain)[7:-2])
+        error = Decimal.from_float(gain) - applied
+        assert 0 <= error < Decimal("0.000001"), (gain, applied)
+
+
+def _transient_wav(path, peak=1.6):
+    """The real-audio QA spike fixture: quiet bed, isolated large transients."""
+    n = 8 * audio.SAMPLE_RATE
+    t = np.arange(n) / audio.SAMPLE_RATE
+    x = .002 * np.sin(2 * np.pi * 440 * t)
+    x[np.arange(audio.SAMPLE_RATE // 2, n, audio.SAMPLE_RATE)] = peak
+    mixer = audio.AudioMixer(7000.)
+    mixer.buf[:] = np.repeat(x[:, None], 2, axis=1).astype(np.float32)
+    return mixer.write_wav(path)
+
+
+def test_transient_pcm_peaks_stay_under_the_ceiling_in_both_builders():
+    ff = shutil.which("ffmpeg")
+    if not ff:
+        return
+    from tests.test_audio_late import _audio_graph
+
+    with tempfile.TemporaryDirectory(prefix="r3d-gain-peak-") as d:
+        d = Path(d)
+        ceiling = 10 ** (audio.PEAK_CEILING_DB / 20)
+        # Covers positive gain, attenuation, and the limiter's clamp.
+        for peak in (.12, .6, .94, 1.6):
+            source = _transient_wav(d / "spikes.wav", peak)
+            gain = audio.mix_gain_db(source)
+            assert gain is not None
+            synchronous = _cmd(mix_gain_db=gain, compact_path="c.mp4")
+            late = audio_late.build_audio_cmd(
+                audio_path=source, master_out="m.m4a", loudnorm=False,
+                preview_out="p.m4a", compact_out="c.m4a", total_dur_s=60.,
+                mix_gain_db=gain)
+            for name, command in (("sync", synchronous), ("late", late)):
+                graph = ";".join(_audio_graph(command)).replace("[IN]", "[0:a]")
+                # Execute the builders' audio graph as float PCM, before AAC.
+                outputs = [d / f"{name}-{label}.wav" for label in ("am", "ap", "ac")]
+                cmd = [ff, "-y", "-v", "error", "-i", str(source),
+                       "-filter_complex", graph]
+                for label, output in zip(("am", "ap", "ac"), outputs):
+                    cmd += ["-map", f"[{label}]", "-c:a", "pcm_f32le", str(output)]
+                subprocess.run(cmd, check=True, capture_output=True)
+                for output in outputs[1:]:  # master retains its .95 mix limiter
+                    pcm = audio.decode_to_pcm(output)
+                    assert float(np.abs(pcm).max()) <= ceiling, (peak, name)
+            if peak == 1.6:
+                # Demonstrate the old two-decimal filter fails this fixture.
+                old = subprocess.check_output([
+                    ff, "-v", "error", "-i", str(source), "-af",
+                    f"{audio.MIX_LIMITER},volume={gain:.2f}dB",
+                    "-f", "f32le", "-acodec", "pcm_f32le", "-"])
+                assert float(np.abs(np.frombuffer(old, dtype="<f4")).max()) > ceiling
+
+
+def test_block_peak_matches_the_previous_whole_array_calculation():
+    with tempfile.TemporaryDirectory(prefix="r3d-gain-scan-") as d:
+        path = Path(d) / "pcm.wav"
+        chunk = audio._PEAK_SCAN_SAMPLES
+        values = np.random.default_rng(17).uniform(-.4, .4, 3 * chunk + 17).astype("<f4")
+        for index, value in ((0, -1.6), (chunk - 1, 2.3), (chunk, -3.1),
+                             (chunk + 1, 4.2), (len(values) - 1, -5.4)):
+            data = values.copy()
+            data[index] = value
+            path.write_bytes(bytes(44) + data.tobytes())
+            assert audio._wav_pcm_peak(path) == float(np.abs(data).max())
+        for value in (0., float("inf"), float("nan")):
+            data = np.zeros(chunk + 1, dtype="<f4")
+            data[chunk - 1] = value
+            path.write_bytes(bytes(44) + data.tobytes())
+            expected = float(np.abs(data).max())
+            got = audio._wav_pcm_peak(path)
+            assert math.isnan(got) if math.isnan(expected) else got == expected
+        path.write_bytes(bytes(47))
+        try:
+            audio._wav_pcm_peak(path)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("truncated float PCM was accepted")
+
+
+def test_block_peak_temporary_memory_is_bounded():
+    with tempfile.TemporaryDirectory(prefix="r3d-gain-memory-") as d:
+        path = Path(d) / "pcm.wav"
+        block = np.full(audio._PEAK_SCAN_SAMPLES, -.8, dtype="<f4").tobytes()
+        with path.open("wb") as fh:
+            fh.write(bytes(44))
+            for _ in range(12):
+                fh.write(block)
+        tracemalloc.start()
+        try:
+            assert audio._wav_pcm_peak(path) == float(np.float32(.8))
+            _, allocated = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        assert allocated < 2 * len(block), allocated
 
 
 SUMMARY = """\
@@ -328,7 +432,7 @@ def test_real_mix_gain_is_the_distance_to_the_target():
         # apply it the way the encode does and measure the result
         out = Path(d) / "out.wav"
         r = subprocess.run([ff, "-y", "-hide_banner", "-loglevel", "error", "-i",
-                            str(mix), "-af", f"{audio.MIX_LIMITER},volume={g:.2f}dB",
+                            str(mix), "-af", f"{audio.MIX_LIMITER},{encode.fixed_gain_filter(g)}",
                             "-c:a", "pcm_f32le", str(out)], capture_output=True)
         assert r.returncode == 0, r.stderr.decode(errors="replace")[-300:]
         got = _measure(ff, out)

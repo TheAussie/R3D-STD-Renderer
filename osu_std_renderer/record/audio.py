@@ -239,6 +239,28 @@ def fixed_gain_db(integrated_lufs: "float | None", peak: float) -> float:
     return gain
 
 
+_PEAK_SCAN_SAMPLES = 1 << 18  # one MiB of float32 PCM, regardless of track length
+
+
+def _wav_pcm_peak(wav_path: Path) -> float:
+    """Peak of write_wav's 44-byte-header float32 PCM with bounded memory."""
+    peak = 0.0
+    with open(wav_path, "rb") as fh:
+        pcm_bytes = os.fstat(fh.fileno()).st_size - 44
+        if pcm_bytes < 0 or pcm_bytes % 4:
+            raise ValueError("incomplete float32 PCM")
+        fh.seek(44)
+        while True:
+            block = np.fromfile(fh, dtype="<f4", count=_PEAK_SCAN_SAMPLES)
+            if not block.size:
+                break
+            np.abs(block, out=block)
+            # Like the former whole-array max, propagate NaNs as well as inf.
+            peak = float(np.maximum(peak, block.max()))
+            del block
+    return peak
+
+
 def mix_gain_db(wav_path: Path) -> "float | None":
     """The fixed gain that stands in for `loudnorm` on the FINISHED mix (the
     preview and Discord copy branch of the encode): measured behind the same
@@ -257,10 +279,7 @@ def mix_gain_db(wav_path: Path) -> "float | None":
         lufs = parse_integrated_lufs(proc.stderr.decode(errors="replace"))
         if lufs is None or lufs <= _NOTHING_LUFS:
             return None
-        # write_wav's file: a 44-byte header, then float32 samples
-        pcm = np.memmap(wav_path, dtype="<f4", mode="r", offset=44)
-        peak = float(np.abs(pcm).max()) if pcm.size else 0.0
-        del pcm
+        peak = _wav_pcm_peak(wav_path)
     except (OSError, ValueError):
         return None
     return fixed_gain_db(lufs, min(peak, _MIX_LIMIT))
