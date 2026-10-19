@@ -195,6 +195,71 @@ def test_no_audio_process_is_started_after_cleanup():
         shutil.rmtree(d, ignore_errors=True)
 
 
+def _assert_mux_failure_reaps_children(spawn_failure):
+    import io
+    from pathlib import Path
+    from unittest.mock import patch
+
+    children = []
+
+    class MuxProcess:
+        def __init__(self, cmd, **kwargs):
+            if spawn_failure and len(children) == 1:
+                raise OSError("mux spawn failed")
+            self.index = len(children)
+            self.returncode = None
+            self.reaped = False
+            self.stderr = io.BytesIO()
+            children.append(self)
+
+        def communicate(self):
+            self.returncode = 1 if self.index == 0 else 0
+            self.reaped = True
+            return b"", b"injected mux failure"
+
+        def poll(self):
+            return self.returncode
+
+        def kill(self):
+            self.returncode = -9
+
+        def wait(self):
+            assert self.returncode is not None
+            self.reaped = True
+            return self.returncode
+
+    with tempfile.TemporaryDirectory(prefix="r3d-late-") as d:
+        la = audio_late.LateAudio(
+            output=Path(d) / "master.mp4",
+            preview_path=Path(d) / "preview.mp4",
+            compact_path=Path(d) / "compact.mp4", mix=lambda mark: None,
+            total_dur_s=1.0, preview_lead=False)
+        with patch.object(audio_late.subprocess, "Popen", MuxProcess):
+            la.start()
+            try:
+                la.finish()
+            except (RuntimeError, OSError) as e:
+                assert ("mux spawn failed" if spawn_failure
+                        else "injected mux failure") in str(e)
+            else:
+                raise AssertionError("finish() swallowed the mux failure")
+            finally:
+                la.cleanup()
+        assert len(children) == (1 if spawn_failure else 3)
+        assert all(p.reaped and p.poll() is not None and p.stderr.closed
+                   for p in children)
+        assert all(p.returncode == -9 for p in
+                   (children if spawn_failure else children[1:]))
+
+
+def test_failed_mux_stops_and_reaps_siblings():
+    _assert_mux_failure_reaps_children(False)
+
+
+def test_failed_mux_spawn_reaps_children_already_started():
+    _assert_mux_failure_reaps_children(True)
+
+
 def _packets(ffmpeg, path, stream):
     out = subprocess.run([ffmpeg, "-v", "error", "-i", path, "-map", f"0:{stream}",
                           "-c", "copy", "-f", "framecrc", "-"],

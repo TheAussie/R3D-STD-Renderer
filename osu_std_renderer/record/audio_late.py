@@ -222,16 +222,29 @@ class LateAudio:
             jobs.append((self.video_preview, self._a_preview, self.preview_path))
         if self.compact_path is not None:
             jobs.append((self.video_compact, self._a_compact, self.compact_path))
-        procs = [(out, subprocess.Popen(
-            build_mux_cmd(v, a if has else None, out),
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE)) for v, a, out in jobs]
-        for out, p in procs:
-            _o, err = p.communicate()
-            if p.returncode != 0:
-                raise RuntimeError("late audio: joining %s failed (%d): %s"
-                                   % (out.name, p.returncode,
-                                      err.decode("utf-8", "replace")[-600:]))
+        procs = []
+        try:
+            for v, a, out in jobs:
+                p = subprocess.Popen(
+                    build_mux_cmd(v, a if has else None, out),
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE)
+                procs.append((out, p))
+            for out, p in procs:
+                _o, err = p.communicate()
+                if p.returncode != 0:
+                    raise RuntimeError("late audio: joining %s failed (%d): %s"
+                                       % (out.name, p.returncode,
+                                          err.decode("utf-8", "replace")[-600:]))
+        finally:
+            # A failed spawn or mux must not leave sibling muxes writing
+            # outputs after the CLI removes their inputs or retries the job.
+            for _out, p in procs:
+                if p.poll() is None:
+                    p.kill()
+                p.wait()
+                if p.stderr is not None:
+                    p.stderr.close()
         return time.monotonic() - t
 
     def cleanup(self) -> None:
