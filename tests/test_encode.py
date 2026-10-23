@@ -14,6 +14,106 @@ import numpy as np
 from osu_std_renderer.record import encode
 
 
+def _nvenc_cmd(encoder="h264_nvenc", **kwargs):
+    options = dict(encoder=encoder, resolution=(1280, 720), fps=60,
+                   output_path="master.mp4")
+    options.update(kwargs)
+    with patch.dict("os.environ", {"R3D_STD_NULL_SINK": "0", "R3D_PREVIEW_LIVE": "0"}):
+        return encode.build_ffmpeg_cmd(**options)
+
+
+def _option(command, name):
+    return command[command.index(name) + 1]
+
+
+_NVENC_LADDER_ANCHORS = (
+    (128, 128, 1, 2_500_000), (1280, 720, 30, 4_000_000),
+    (1280, 720, 60, 6_498_019), (1920, 1080, 60, 11_463_276),
+    (2560, 1440, 60, 16_000_000), (1920, 1080, 120, 16_000_000))
+
+
+def test_h264_nvenc_auto_bitrate_uses_cq23_with_existing_ladder_caps():
+    for w, h, fps, target in _NVENC_LADDER_ANCHORS:
+        command = _nvenc_cmd("h264_nvenc", resolution=(w, h), fps=fps)
+        assert encode.nvenc_target_bps(w, h, fps) == target
+        assert _option(command, "-rc") == "vbr"
+        assert _option(command, "-cq") == "23"
+        assert _option(command, "-b:v") == "0"
+        assert _option(command, "-maxrate") == str(int(target * 1.5))
+        assert _option(command, "-bufsize") == str(target * 2)
+        assert command.index("-c:v") < command.index("-cq") < command.index("master.mp4")
+
+
+def test_hevc_nvenc_auto_bitrate_preserves_existing_target_vbr_ladder():
+    for w, h, fps, target in _NVENC_LADDER_ANCHORS:
+        command = _nvenc_cmd("hevc_nvenc", resolution=(w, h), fps=fps)
+        assert _option(command, "-rc") == "vbr"
+        assert "-cq" not in command
+        assert _option(command, "-b:v") == str(target)
+        assert _option(command, "-maxrate") == str(int(target * 1.5))
+        assert _option(command, "-bufsize") == str(target * 2)
+
+
+def test_nvenc_explicit_video_bitrate_keeps_its_vbr_target_contract():
+    for encoder in ("h264_nvenc", "hevc_nvenc"):
+        for bitrate in (1_000_000, 24_000_000, 42_000_000):
+            command = _nvenc_cmd(encoder, video_bitrate=bitrate)
+            assert _option(command, "-rc") == "vbr"
+            assert _option(command, "-b:v") == str(bitrate)
+            assert _option(command, "-maxrate") == str(int(bitrate * 1.5))
+            assert _option(command, "-bufsize") == str(bitrate * 2)
+            assert "-cq" not in command
+
+
+def test_nvenc_default_quality_is_independent_of_x264_crf():
+    for encoder in ("h264_nvenc", "hevc_nvenc"):
+        assert _nvenc_cmd(encoder, crf=10) == _nvenc_cmd(encoder, crf=40)
+        # Zero has always selected the automatic ladder, rather than a 0 bps override.
+        assert _nvenc_cmd(encoder, video_bitrate=0) == _nvenc_cmd(encoder)
+
+
+def test_nvenc_codec_policies_are_scoped_to_the_master_output():
+    for encoder in ("h264_nvenc", "hevc_nvenc"):
+        for stream in (False, True):
+            for hardware_preview in (False, True):
+                command = _nvenc_cmd(
+                    encoder, audio_path="mix.wav", preview_path="preview.embed.mp4",
+                    compact_path="compact.mp4", total_dur_s=180., loudnorm=False,
+                    stream_master=stream, preview_hw=hardware_preview)
+                master = command[:command.index("master.mp4")]
+                side_outputs = command[command.index("master.mp4") + 1:]
+                assert master.index("[vm]") < master.index("-c:v") < master.index("-rc")
+                if encoder == "h264_nvenc":
+                    assert _option(master, "-cq") == "23"
+                    assert _option(master, "-b:v") == "0"
+                else:
+                    assert "-cq" not in master
+                    assert _option(master, "-b:v") == "6498019"
+                assert "-cq" not in side_outputs and "-rc" not in side_outputs
+                assert command.count(encoder) == 1
+                assert ("+faststart" in master) == (not stream)
+                assert ("h264_videotoolbox" in side_outputs) == hardware_preview
+                assert "libx264" in side_outputs
+
+
+def test_nvenc_policy_does_not_leak_into_vaapi_or_x264_commands():
+    for encoder in ("h264_vaapi", "libx264"):
+        for bitrate in (None, 4_000_000):
+            command = _nvenc_cmd(encoder, video_bitrate=bitrate,
+                                 preview_path="preview.embed.mp4", compact_path="compact.mp4",
+                                 total_dur_s=180.)
+            assert "-cq" not in command and "-rc" not in command
+            master = command[:command.index("master.mp4")]
+            if encoder == "h264_vaapi":
+                assert _option(master, "-vaapi_device") == "/dev/dri/renderD128"
+                assert "format=nv12,hwupload" in _option(command, "-filter_complex")
+                assert _option(master, "-b:v") == str(bitrate or 6_498_019)
+            elif bitrate:
+                assert _option(master, "-b:v") == str(bitrate)
+            else:
+                assert "-crf" in master and "-b:v" not in master
+
+
 def _listing(*names):
     return SimpleNamespace(returncode=0, stderr="", stdout="\n".join(
         f" V....D {name} H.264 encoder" for name in names))

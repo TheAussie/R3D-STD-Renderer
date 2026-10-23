@@ -476,13 +476,14 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
             vc += ["-crf", _X264_CRF or str(crf), "-preset", _X264_PRESET,
                     "-profile:v", "high"] + _x264_extra()
     elif encoder in ("h264_nvenc", "hevc_nvenc"):
-        # Resolution-scaled NVENC bitrate ladder (R3D cross-engine policy,
-        # 2026-07): replaces the 2026-07-21 CQ scheme (cq=crf+4, -b:v 0,
-        # maxrate (w*h)/150k) with the shared target-VBR ladder so all four
-        # engines land on the same size/quality curve -- see nvenc_target_bps.
+        # Automatic H.264 CQ23 uses the ladder for its VBV caps. HEVC and
+        # explicit bitrate overrides retain the existing target-VBR policy.
         _tgt = video_bitrate or nvenc_target_bps(w, h, fps)
-        vc += ["-rc", "vbr", "-b:v", str(_tgt),
-                "-maxrate", str(int(_tgt * 1.5)), "-bufsize", str(_tgt * 2),
+        vc += ["-rc", "vbr"]
+        vc += (["-cq", "23", "-b:v", "0"]
+               if encoder == "h264_nvenc" and not video_bitrate
+               else ["-b:v", str(_tgt)])
+        vc += ["-maxrate", str(int(_tgt * 1.5)), "-bufsize", str(_tgt * 2),
                 "-profile:v", "high"]
     elif is_vaapi:
         _vb = video_bitrate or nvenc_target_bps(w, h, fps)
