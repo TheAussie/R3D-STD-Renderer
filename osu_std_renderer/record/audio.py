@@ -31,6 +31,8 @@ from pathlib import Path
 
 import numpy as np
 
+from osu_std_renderer.security import ffmpeg_file_input_args
+
 SAMPLE_RATE = 48000
 CHANNELS = 2
 
@@ -239,7 +241,7 @@ def decode_to_pcm(path: Path, *, rate: float = 1.0,
             if cached is not None:
                 return cached
 
-    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(path)]
+    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", *ffmpeg_file_input_args(path)]
     if loudnorm:
         # LOUDNORM DUCK FIX (#17): normalise the MUSIC ALONE here (music-only,
         # no hit transients) so the encode does NOT loudnorm the song+hits mix

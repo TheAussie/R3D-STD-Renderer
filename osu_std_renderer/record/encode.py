@@ -25,6 +25,7 @@ import threading
 from pathlib import Path
 
 from ..render import perf
+from ..security import ffmpeg_file_input_args
 
 LOUDNORM = "loudnorm=I=-18:TP=-1.5:LRA=11"
 
@@ -456,7 +457,7 @@ def build_ffmpeg_cmd(*, encoder: str, resolution: tuple[int, int], fps: int,
     if audio_path is not None:
         if audio_offset_ms:
             cmd += ["-itsoffset", f"{audio_offset_ms / 1000.0:.3f}"]
-        cmd += ["-i", str(audio_path)]
+        cmd += ffmpeg_file_input_args(audio_path)
     # Frames arrive BOTTOM-UP on stdin and ffmpeg's vflip filter restores
     # them (an exact row reorder on rawvideo — zero pixel math; the mania
     # v2 prod encoder ships the same shape). This lets the writer hand

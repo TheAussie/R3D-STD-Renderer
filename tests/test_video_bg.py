@@ -72,3 +72,18 @@ def test_negative_offset_video_already_playing():
             assert v._cur_idx >= 8
         finally:
             v.close()
+
+
+def test_unsupported_video_extension_fails_soft():
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "video.bin"
+        path.write_bytes(b"unsupported media")
+
+        v = VideoBackground(
+            path, width=W, height=H, fps=FPS, start_ms=0
+        )
+        try:
+            assert not v.active_at(0)
+            assert v.frame_for(0) is None
+        finally:
+            v.close()

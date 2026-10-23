@@ -552,6 +552,22 @@ def test_bundled_argon_font_loads_and_is_not_dejavu():
     assert all(g[..., 3].max() > 0 for g in glyphs.values())
 
 
+def test_hud_font_is_the_bundled_one_on_every_platform():
+    """The DejaVu labels must never fall through to Pillow's built-in font:
+    it ignores the size asked for, and the Argon scales are measured against
+    this font (a Mac drew GREAT at 65% and the key counts tiny)."""
+    import os
+    from PIL import ImageFont
+    from osu_std_renderer.render import textures as T
+    assert os.path.isfile(T.BUNDLED_FONT_PATH), T.BUNDLED_FONT_PATH
+    assert T._FONT_CANDIDATES[0] == T.BUNDLED_FONT_PATH
+    f = T._load_font(64)
+    assert isinstance(f, ImageFont.FreeTypeFont) and f.path == T.BUNDLED_FONT_PATH, getattr(f, "path", f)
+    assert f.getname() == ("DejaVu Sans", "Bold")
+    x0, y0, x1, y1 = f.getbbox("GREAT")
+    assert 40 <= y1 - y0 <= 60 and x1 - x0 > 200, (x0, y0, x1, y1)   # really 64 px
+
+
 def test_argon_cap_scale_holds_visible_size():
     """The glyph/digit cap-fill scales re-derive the size so the font swap
     does NOT change the visible cap size (measured cap-fill drives them)."""

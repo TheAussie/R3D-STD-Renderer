@@ -34,6 +34,8 @@ import sys
 import threading
 from pathlib import Path
 
+from osu_std_renderer.security import ffmpeg_file_input_args
+
 # Frames buffered ahead of the render loop. Enough to overlap decode with
 # the GPU draw without hoarding memory — a 4K RGBA frame is ~33 MB, so 4
 # frames is ~130 MB worst case at 2160p, a few MB at 720p. (mania value.)
@@ -64,15 +66,18 @@ class VideoBackground:
         # frame N once the video has started (at 1× rate).
         vf = (f"scale={width}:{height}:force_original_aspect_ratio=increase,"
               f"crop={width}:{height},fps={self.fps},format=rgba")
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
-               "-i", str(path), "-an", "-sn", "-vf", vf,
-               "-f", "rawvideo", "-pix_fmt", "rgba", "-"]
+
         try:
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error",
+                   *ffmpeg_file_input_args(path), "-an", "-sn", "-vf", vf,
+                   "-f", "rawvideo", "-pix_fmt", "rgba", "-"]
+
             self._proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, bufsize=0)
-        except OSError as e:
-            print(f"WARNING: video decode spawn failed ({e}) — static "
+
+        except (OSError, ValueError) as e:
+            print(f"WARNING: background video unavailable ({e}) — static "
                   "background", file=sys.stderr)
             self._proc = None
             self._failed = True

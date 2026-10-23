@@ -62,7 +62,19 @@ RING_THICKNESS = 0.128       # of radius; matches lazer BORDER_PORTION
 APPROACH_THICKNESS = 0.09
 _AA_PX = 1.5                 # texture-space anti-alias band
 
+# The HUD's own font, DejaVu Sans Bold, ships with the engine and is tried
+# first, so every platform draws the same glyphs. It used to be looked up only
+# in Linux system folders: a Mac or a Windows node found none, fell through to
+# Pillow's built-in font (about 10 px whatever size is asked for), and drew
+# every DejaVu label tiny. The Argon text shrank with it, to 65% (digits 55%),
+# because ARGON_GLYPH_CAP_SCALE / ARGON_DIGIT_CAP_SCALE below are measured
+# against this font at import. The bundled file is the one Ubuntu 24.04 ships
+# (2.37, sha256 5c1247ac...2ce895), which is what the Linux nodes were already
+# drawing with. Licence: assets/fonts/LICENSE_DEJAVU.txt.
+BUNDLED_FONT_PATH = os.path.normpath(os.path.join(
+    os.path.dirname(__file__), "..", "assets", "fonts", "DejaVuSans-Bold.ttf"))
 _FONT_CANDIDATES = (
+    BUNDLED_FONT_PATH,
     "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
     "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",

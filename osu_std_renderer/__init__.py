@@ -37,4 +37,13 @@ Package map (module → RENDER_PLAN.md section):
     cli.py                   —         adapter-contract CLI (mirrors catch_renderer.py)
 """
 
+import warnings
+
+from PIL import Image
+
+# Treat Pillow's warning-only decompression-bomb band as a failed asset, not a
+# memory allocation.  Every untrusted skin/beatmap image passes through Pillow.
+Image.MAX_IMAGE_PIXELS = 50_000_000
+warnings.simplefilter("error", Image.DecompressionBombWarning)
+
 __version__ = "0.1.0.dev0"

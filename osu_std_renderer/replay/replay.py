@@ -28,6 +28,8 @@ from pathlib import Path
 
 from osrparse import Replay
 
+from osu_std_renderer.security import bounded_lzma_decompress, validate_replay_payload
+
 from .lazer_mods import (LAZER_GAME_VERSION,
                          approach_different_from_mods,
                          barrel_roll_from_mods,
@@ -420,8 +422,11 @@ def _recover_leadin_offset(path: Path) -> int:
         off += 8                       # timestamp (int64)
         rlen = struct.unpack_from("<i", data, off)[0]
         off += 4                       # replay-data length (int32)
-        raw = lzma.decompress(data[off:off + rlen],
-                              format=lzma.FORMAT_AUTO).decode("ascii", "replace")
+        if rlen < 0 or rlen > len(data) - off:
+            raise ValueError("invalid replay payload length")
+        raw = bounded_lzma_decompress(
+            data[off:off + rlen], format=lzma.FORMAT_AUTO
+        ).decode("ascii", "replace")
 
         lead = 0
         for i, group in enumerate(raw.rstrip(",").split(",")):
@@ -447,6 +452,7 @@ def parse_replay(path: Path) -> tuple[list[StdFrame], ReplayMeta]:
     if not path.exists():
         raise ReplayParseError(f"replay not found: {path}")
     try:
+        validate_replay_payload(path)
         r = Replay.from_path(path)
     except Exception as e:  # noqa: BLE001 - osrparse raises bare exceptions
         raise ReplayParseError(f"osrparse failed: {e}") from e

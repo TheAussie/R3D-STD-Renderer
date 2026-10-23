@@ -24,6 +24,8 @@ import struct
 from dataclasses import dataclass
 from pathlib import Path
 
+from osu_std_renderer.security import bounded_lzma_decompress
+
 log = logging.getLogger(__name__)
 
 # .osr game_version cutoff: stable writes 8-digit YYYYMMDD dates (~20251128),
@@ -106,9 +108,13 @@ def parse_lazer_score_info(osr_path: Path) -> dict | None:
             return None
         compressed = buf[pos:pos + length]
         try:
-            decompressed = lzma.decompress(compressed, format=lzma.FORMAT_ALONE)
+            decompressed = bounded_lzma_decompress(
+                compressed, format=lzma.FORMAT_ALONE
+            )
         except lzma.LZMAError:
-            decompressed = lzma.decompress(compressed, format=lzma.FORMAT_AUTO)
+            decompressed = bounded_lzma_decompress(
+                compressed, format=lzma.FORMAT_AUTO
+            )
         return json.loads(decompressed.decode("utf-8"))
     except (struct.error, ValueError, lzma.LZMAError,
             json.JSONDecodeError, UnicodeDecodeError, IndexError) as e:

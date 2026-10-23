@@ -9,6 +9,7 @@ import sys
 import traceback
 
 MODULES = [
+    "tests.test_input_security",
     "tests.test_difficulty",
     "tests.test_sliderpath",
     "tests.test_parser_synthetic",
